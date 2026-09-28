@@ -1,5 +1,5 @@
-// noteSS v1.0 - ultra-light quick note capture for Memos API v1.
-// Single-file GTK4 + libcurl + pthread client. KISS by design.
+// noteSS v1.1.0 - ultra-light quick note capture for Memos API v1.
+// Single-file GTK4 + libcurl + pthread client (plus cache.c for offline fallback). KISS by design.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
@@ -13,13 +13,17 @@
 //   2. If config is missing/incomplete, show a setup window to enter URL + token.
 //   3. Main window: text field + Send button. Ctrl+Enter sends, Escape closes.
 //   4. POST {memos_url}/api/v1/memos runs in a background pthread (UI never blocks).
-//   5. Success (200/201) closes the app, failure shows an error dialog.
+//   5. Success (200/201) closes the app; if the server is unreachable the note
+//      is saved to the local cache ($XDG_CACHE_HOME/noteSS) and uploaded
+//      on the next launch: in the background at startup and right after the
+//      next successful send (see cache.c). Failure shows an error dialog.
 
 #include <ctype.h>
 #include <curl/curl.h>
 #include <gtk/gtk.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,11 +31,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "cache.h"
+
 #define APP_ID "org.notess.app"
 #define CONFIG_REL_PATH "/noteSS/config.conf"
 #define URL_MAX 1024
 #define TOKEN_MAX 2048
 #define TEXT_MAX (64 * 1024)
+#define SEND_TIMEOUT_SEC 5 // give up fast on a dead server, fall back to cache
+#define HINT_NORMAL "Ctrl+Enter to send, Esc to close"
+#define HINT_UPLOADING "Uploading cached notes in the background..."
 
 // ---------------------------------------------------------------------------
 // Config
@@ -249,6 +258,7 @@ typedef struct {
     char *endpoint;
     char *token;
     char *json_body;
+    char *text; // plain note text, kept for the offline cache fallback
     GtkWindow *window; // reffed, for the completion callback
     GtkButton *send_button; // reffed
 } SendJob;
@@ -258,6 +268,7 @@ typedef struct {
     gboolean ok;
     long http_code;
     char *message; // error text or server response
+    char *text; // plain note text, saved to cache if sending failed
     GtkWindow *window; // reffed
     GtkButton *send_button; // reffed
 } SendResult;
@@ -274,11 +285,13 @@ static void *send_thread_func(void *arg) {
         free(job->endpoint);
         free(job->token);
         free(job->json_body);
+        g_free(job->text);
         free(job);
         return NULL;
     }
     res->window = job->window; // transfer refs
     res->send_button = job->send_button;
+    res->text = job->text; // transfer text (freed on the main thread)
     res->ok = FALSE;
     res->message = NULL;
 
@@ -309,9 +322,9 @@ static void *send_thread_func(void *arg) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, SEND_TIMEOUT_SEC);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "noteSS/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "noteSS/1.1.0");
 
     CURLcode rc = curl_easy_perform(curl);
     long code = 0;
@@ -333,6 +346,12 @@ static void *send_thread_func(void *arg) {
             res->message = g_strdup_printf("Server returned HTTP %ld.", code);
     }
 
+    // The current note is sent: upload cached notes in the same thread.
+    // The app quits right after a successful send, which would otherwise kill
+    // the startup background flush before it finishes.
+    if (res->ok)
+        cache_flush_sync(job->endpoint, job->token);
+
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(resp.data);
@@ -346,7 +365,29 @@ static void *send_thread_func(void *arg) {
     return NULL;
 }
 
+// Build a message dialog with an explicit English "Close" button.
+// (Stock GTK buttons follow the system locale, e.g. Russian "Закрыть".)
+// The dialog destroys itself on response; the caller presents it.
+static GtkWidget *close_dialog_new(GtkWindow *parent, GtkMessageType type,
+                                   const char *format, ...) {
+    char *text;
+    va_list ap;
+    va_start(ap, format);
+    text = g_strdup_vprintf(format, ap);
+    va_end(ap);
+
+    GtkWidget *dlg = gtk_message_dialog_new(parent, GTK_DIALOG_MODAL, type,
+                                            GTK_BUTTONS_NONE, "%s",
+                                            text != NULL ? text : "");
+    g_free(text);
+    gtk_dialog_add_button(GTK_DIALOG(dlg), "Close", GTK_RESPONSE_CLOSE);
+    g_signal_connect_swapped(dlg, "response", G_CALLBACK(gtk_window_destroy), dlg);
+    return dlg;
+}
+
 // Main-thread completion: close on success, show dialog on error.
+// If sending failed, the note is saved to the local cache and the app
+// closes as well; cached notes are uploaded on the next launch.
 static gboolean on_send_done(gpointer data) {
     SendResult *res = data;
 
@@ -359,18 +400,29 @@ static gboolean on_send_done(gpointer data) {
             g_application_quit(gapp);
         else
             gtk_window_close(res->window);
+    } else if (res->text != NULL && cache_save_note(res->text) == 0) {
+        size_t pending = cache_pending_count();
+        GtkWidget *dlg = close_dialog_new(
+            res->window, GTK_MESSAGE_INFO,
+            "Server unavailable. Note saved locally (%zu pending).\n"
+            "It will be uploaded on the next start.",
+            pending);
+        GApplication *gapp = g_application_get_default();
+        if (gapp != NULL)
+            g_signal_connect_swapped(dlg, "response", G_CALLBACK(g_application_quit), gapp);
+        gtk_window_present(GTK_WINDOW(dlg));
     } else {
-        GtkWidget *dlg = gtk_message_dialog_new(
-            res->window, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+        GtkWidget *dlg = close_dialog_new(
+            res->window, GTK_MESSAGE_ERROR,
             "Failed to send note (HTTP %ld).\n%s", res->http_code,
             res->message != NULL ? res->message : "Unknown error.");
-        g_signal_connect_swapped(dlg, "response", G_CALLBACK(gtk_window_destroy), dlg);
         gtk_window_present(GTK_WINDOW(dlg));
     }
 
     g_object_unref(res->window);
     g_object_unref(res->send_button);
     g_free(res->message);
+    g_free(res->text);
     free(res);
     return G_SOURCE_REMOVE;
 }
@@ -409,12 +461,13 @@ static void submit_note(MainUI *ui) {
     snprintf(endpoint, sizeof(endpoint), "%s/api/v1/memos", ui->cfg.memos_url);
 
     char *json_body = json_build_memo(text);
+    // Copy first: text points inside raw, which is freed below.
+    char *text_copy = g_strdup(text); // plain text, cached if the server is down
     g_free(raw);
     if (json_body == NULL) {
-        GtkWidget *dlg = gtk_message_dialog_new(ui->window, GTK_DIALOG_MODAL,
-                                                GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
-                                                "Out of memory while building the request.");
-        g_signal_connect_swapped(dlg, "response", G_CALLBACK(gtk_window_destroy), dlg);
+        g_free(text_copy);
+        GtkWidget *dlg = close_dialog_new(ui->window, GTK_MESSAGE_ERROR,
+                                          "Out of memory while building the request.");
         gtk_window_present(GTK_WINDOW(dlg));
         return;
     }
@@ -422,13 +475,26 @@ static void submit_note(MainUI *ui) {
     SendJob *job = malloc(sizeof(*job));
     if (job == NULL) {
         free(json_body);
+        g_free(text_copy);
         return;
     }
     job->endpoint = g_strdup(endpoint);
     job->token = g_strdup(ui->cfg.access_token);
     job->json_body = json_body; // malloc'd, freed by the worker
+    job->text = text_copy;
     job->window = g_object_ref(ui->window);
     job->send_button = g_object_ref(ui->send_button);
+    if (job->text == NULL) {
+        g_object_unref(job->window);
+        g_object_unref(job->send_button);
+        g_free(job->endpoint);
+        g_free(job->token);
+        free(job->json_body);
+        free(job);
+        gtk_widget_set_sensitive(GTK_WIDGET(ui->send_button), TRUE);
+        gtk_button_set_label(ui->send_button, "Send");
+        return;
+    }
 
     gtk_widget_set_sensitive(GTK_WIDGET(ui->send_button), FALSE);
     gtk_button_set_label(ui->send_button, "Sending...");
@@ -445,13 +511,12 @@ static void submit_note(MainUI *ui) {
         g_free(job->endpoint);
         g_free(job->token);
         free(job->json_body);
+        g_free(job->text);
         free(job);
         gtk_widget_set_sensitive(GTK_WIDGET(ui->send_button), TRUE);
         gtk_button_set_label(ui->send_button, "Send");
-        GtkWidget *dlg = gtk_message_dialog_new(ui->window, GTK_DIALOG_MODAL,
-                                                GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
-                                                "Failed to start background thread.");
-        g_signal_connect_swapped(dlg, "response", G_CALLBACK(gtk_window_destroy), dlg);
+        GtkWidget *dlg = close_dialog_new(ui->window, GTK_MESSAGE_ERROR,
+                                          "Failed to start background thread.");
         gtk_window_present(GTK_WINDOW(dlg));
         return;
     }
@@ -475,6 +540,22 @@ static gboolean on_text_key_pressed(GtkEventControllerKey *ctl, guint keyval,
         return TRUE;
     }
     return FALSE;
+}
+
+// Hint restore after the startup cache flush. The label is reffed, so the
+// callback stays safe even if the window was closed in the meantime.
+typedef struct {
+    GtkLabel *hint;
+} FlushHint;
+
+static void on_flush_done(void *data) {
+    FlushHint *fh = data;
+    if (cache_pending_count() == 0)
+        gtk_label_set_text(fh->hint, HINT_NORMAL);
+    else
+        gtk_label_set_text(fh->hint, "Some cached notes were kept for the next start.");
+    g_object_unref(fh->hint);
+    free(fh);
 }
 
 // Build the main capture window.
@@ -513,7 +594,7 @@ static void build_main_window(GtkApplication *app, const AppConfig *cfg) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(box), row);
 
-    GtkWidget *hint = gtk_label_new("Ctrl+Enter to send, Esc to close");
+    GtkWidget *hint = gtk_label_new(HINT_NORMAL);
     gtk_widget_set_opacity(hint, 0.6);
     gtk_widget_set_halign(hint, GTK_ALIGN_START);
     gtk_widget_set_hexpand(hint, TRUE);
@@ -526,6 +607,23 @@ static void build_main_window(GtkApplication *app, const AppConfig *cfg) {
 
     // Free UI struct when the window is destroyed.
     g_signal_connect_data(ui->window, "destroy", G_CALLBACK(g_free), ui, NULL, G_CONNECT_SWAPPED);
+
+    // Offline cache: upload notes saved while the server was unreachable.
+    // Successfully uploaded notes are deleted from the cache; the rest
+    // stay for the next launch.
+    size_t pending = cache_pending_count();
+    if (pending > 0) {
+        gtk_label_set_text(GTK_LABEL(hint), HINT_UPLOADING);
+        char endpoint[URL_MAX + 32];
+        snprintf(endpoint, sizeof(endpoint), "%s/api/v1/memos", ui->cfg.memos_url);
+        FlushHint *fh = malloc(sizeof(*fh));
+        if (fh != NULL) {
+            fh->hint = GTK_LABEL(g_object_ref(hint));
+            cache_flush_async_done(endpoint, ui->cfg.access_token, on_flush_done, fh);
+        } else {
+            cache_flush_async(endpoint, ui->cfg.access_token);
+        }
+    }
 
     gtk_window_present(ui->window);
     gtk_widget_grab_focus(GTK_WIDGET(ui->text_view));
@@ -560,20 +658,17 @@ static void on_setup_save(GtkButton *btn, gpointer data) {
     strip_trailing_slash(cfg.memos_url);
 
     if (cfg.memos_url[0] == '\0' || cfg.access_token[0] == '\0') {
-        GtkWidget *dlg = gtk_message_dialog_new(su->window, GTK_DIALOG_MODAL,
-                                                GTK_MESSAGE_WARNING, GTK_BUTTONS_CLOSE,
-                                                "Please fill in both Memos URL and Access Token.");
-        g_signal_connect_swapped(dlg, "response", G_CALLBACK(gtk_window_destroy), dlg);
+        GtkWidget *dlg = close_dialog_new(su->window, GTK_MESSAGE_WARNING,
+                                          "Please fill in both Memos URL and Access Token.");
         gtk_window_present(GTK_WINDOW(dlg));
         return;
     }
 
     char *path = config_file_path();
     if (path == NULL || !config_save(path, &cfg)) {
-        GtkWidget *dlg = gtk_message_dialog_new(
-            su->window, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+        GtkWidget *dlg = close_dialog_new(
+            su->window, GTK_MESSAGE_ERROR,
             "Could not write config file: %s", path != NULL ? path : "(unknown path)");
-        g_signal_connect_swapped(dlg, "response", G_CALLBACK(gtk_window_destroy), dlg);
         gtk_window_present(GTK_WINDOW(dlg));
         free(path);
         return;

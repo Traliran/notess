@@ -1,16 +1,20 @@
-# noteSS v1.0
+# noteSS v1.1.0
 
 Ultra-light desktop app for fast text-note capture to [Memos](https://www.usememos.com/) API v1.
 Pure C, GTK 4, libcurl. No JSON libraries, no bloat — KISS.
 
 A compact floating window with a single text field and a Send button.
 Type, press `Ctrl+Enter`, the window closes — the note is already in Memos.
+If the server is unreachable, the note is saved locally and uploaded on the next start.
 
 ## Features
 
 - Minimal GTK 4 window (fixed size), autofocus on start.
 - `Ctrl+Enter` sends, `Escape` closes.
 - Non-blocking UI: HTTP POST runs in a background `pthread`, UI updates via `g_idle_add`.
+- Offline cache: failed notes are stored under `$XDG_CACHE_HOME/noteSS`
+  (fallback `~/.cache/noteSS`, `chmod 600`) and uploaded in the background
+  on the next start; each uploaded note is deleted from the cache.
 - XDG config with `chmod 600`; friendly GTK setup window on first run.
 - Manual safe JSON escaping (`"`, `\`, newlines, control chars) — no extra deps.
 
@@ -34,7 +38,7 @@ make
 One-liner (same as the `Makefile` does):
 
 ```sh
-gcc main.c -o notess $(pkg-config --cflags --libs gtk4 libcurl) -lpthread
+gcc main.c cache.c -o notess $(pkg-config --cflags --libs gtk4 libcurl) -lpthread
 ```
 
 Optional system install:
@@ -75,11 +79,28 @@ Body: `{"content": "your text"}`.
 1. Run `./notess` (bind it to a global hotkey in your WM/DE for quick capture).
 2. Type the note.
 3. `Ctrl+Enter` or click **Send** — success closes the window silently.
-4. On network/server error a message dialog shows the libcurl or server error text.
+4. On network/server error the note is saved to the local cache and an info
+   dialog shows the pending count; the app closes and cached notes are
+   uploaded in the background on the next start.
+5. If even the local save fails, a message dialog shows the libcurl or server error text.
+
+## Offline cache
+
+Cache path (XDG standard):
+
+- `$XDG_CACHE_HOME/noteSS`, fallback to `~/.cache/noteSS`
+
+Each unsent note is one plain-text file (`note-<epoch>-<pid>-<counter>.txt`,
+mode `600`). On every start noteSS uploads cached notes oldest-first in a
+background thread, and again right after the next successful send (the app
+would otherwise quit before the background upload finishes); each note that
+gets HTTP `200`/`201` is deleted from the cache, the rest stay for the next
+launch. No extra configuration needed.
 
 ## Project layout
 
-- `main.c` — whole app (config, UI, JSON, curl thread).
+- `main.c` — app (config, UI, JSON, curl thread).
+- `cache.c` / `cache.h` — offline cache (local save, background upload, cleanup).
 - `Makefile` — `make`, `make clean`, `make install`.
 - `LICENSE` — GNU GPLv3 license text.
 - `README.md` — this file.

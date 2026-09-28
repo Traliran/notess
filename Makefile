@@ -1,6 +1,7 @@
 CC      ?= gcc
 TARGET  := notess
-SRC     := main.c
+SRC     := main.c cache.c
+HEADERS := cache.h
 
 CFLAGS   += -O2 -Wall -Wextra -Wpedantic -std=c11
 GTKFLAGS := $(shell pkg-config --cflags gtk4 libcurl)
@@ -11,8 +12,8 @@ BINDIR   := $(PREFIX)/bin
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(GTKFLAGS) -o $@ $< $(LDLIBS)
+$(TARGET): $(SRC) $(HEADERS)
+	$(CC) $(CFLAGS) $(GTKFLAGS) -o $@ $(SRC) $(LDLIBS)
 
 clean:
 	rm -f $(TARGET)
