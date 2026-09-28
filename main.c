@@ -39,6 +39,8 @@
 #define TOKEN_MAX 2048
 #define TEXT_MAX (64 * 1024)
 #define SEND_TIMEOUT_SEC 5 // give up fast on a dead server, fall back to cache
+#define HINT_NORMAL "Ctrl+Enter to send, Esc to close"
+#define HINT_UPLOADING "Uploading cached notes in the background..."
 
 // ---------------------------------------------------------------------------
 // Config
@@ -540,6 +542,22 @@ static gboolean on_text_key_pressed(GtkEventControllerKey *ctl, guint keyval,
     return FALSE;
 }
 
+// Hint restore after the startup cache flush. The label is reffed, so the
+// callback stays safe even if the window was closed in the meantime.
+typedef struct {
+    GtkLabel *hint;
+} FlushHint;
+
+static void on_flush_done(void *data) {
+    FlushHint *fh = data;
+    if (cache_pending_count() == 0)
+        gtk_label_set_text(fh->hint, HINT_NORMAL);
+    else
+        gtk_label_set_text(fh->hint, "Some cached notes were kept for the next start.");
+    g_object_unref(fh->hint);
+    free(fh);
+}
+
 // Build the main capture window.
 static void build_main_window(GtkApplication *app, const AppConfig *cfg) {
     MainUI *ui = g_new0(MainUI, 1);
@@ -576,7 +594,7 @@ static void build_main_window(GtkApplication *app, const AppConfig *cfg) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_box_append(GTK_BOX(box), row);
 
-    GtkWidget *hint = gtk_label_new("Ctrl+Enter to send, Esc to close");
+    GtkWidget *hint = gtk_label_new(HINT_NORMAL);
     gtk_widget_set_opacity(hint, 0.6);
     gtk_widget_set_halign(hint, GTK_ALIGN_START);
     gtk_widget_set_hexpand(hint, TRUE);
@@ -595,11 +613,16 @@ static void build_main_window(GtkApplication *app, const AppConfig *cfg) {
     // stay for the next launch.
     size_t pending = cache_pending_count();
     if (pending > 0) {
-        gtk_label_set_text(GTK_LABEL(hint),
-                           "Uploading cached notes in the background...");
+        gtk_label_set_text(GTK_LABEL(hint), HINT_UPLOADING);
         char endpoint[URL_MAX + 32];
         snprintf(endpoint, sizeof(endpoint), "%s/api/v1/memos", ui->cfg.memos_url);
-        cache_flush_async(endpoint, ui->cfg.access_token);
+        FlushHint *fh = malloc(sizeof(*fh));
+        if (fh != NULL) {
+            fh->hint = GTK_LABEL(g_object_ref(hint));
+            cache_flush_async_done(endpoint, ui->cfg.access_token, on_flush_done, fh);
+        } else {
+            cache_flush_async(endpoint, ui->cfg.access_token);
+        }
     }
 
     gtk_window_present(ui->window);

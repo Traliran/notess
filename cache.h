@@ -30,4 +30,10 @@ void cache_flush_async(const char *endpoint, const char *token);
 // Safe to call from any worker thread (calls are serialized internally).
 void cache_flush_sync(const char *endpoint, const char *token);
 
+// Same as cache_flush_async, but calls done(data) on the GTK main thread after the
+// upload attempt finishes (even when the cache was empty). done() must be
+// fast and non-blocking; it may be NULL (behaves like cache_flush_async).
+void cache_flush_async_done(const char *endpoint, const char *token,
+                            void (*done)(void *data), void *data);
+
 #endif // NOTESS_CACHE_H

@@ -253,7 +253,22 @@ static gboolean cache_post_note(const char *endpoint, const char *token, const c
 typedef struct {
     char *endpoint;
     char *token;
+    void (*done)(void *data);
+    void *data;
 } FlushJob;
+
+typedef struct {
+    void (*done)(void *data);
+    void *data;
+} FlushDone;
+
+// Runs on the GTK main thread: notify the caller, then drop the wrapper.
+static gboolean flush_done_idle(gpointer data) {
+    FlushDone *d = data;
+    d->done(d->data);
+    free(d);
+    return G_SOURCE_REMOVE;
+}
 
 // Upload every cached note in order; delete each file on success.
 // Failures are left in the cache for the next launch.
@@ -280,6 +295,15 @@ void cache_flush_sync(const char *endpoint, const char *token) {
 static void *flush_thread_func(void *arg) {
     FlushJob *job = arg;
     cache_flush_sync(job->endpoint, job->token);
+    if (job->done != NULL) {
+        // Schedule the notification on the main thread (never blocks here).
+        FlushDone *d = malloc(sizeof(*d));
+        if (d != NULL) {
+            d->done = job->done;
+            d->data = job->data;
+            g_idle_add(flush_done_idle, d);
+        }
+    }
 
     g_free(job->endpoint);
     g_free(job->token);
@@ -288,16 +312,23 @@ static void *flush_thread_func(void *arg) {
 }
 
 void cache_flush_async(const char *endpoint, const char *token) {
+    cache_flush_async_done(endpoint, token, NULL, NULL);
+}
+
+void cache_flush_async_done(const char *endpoint, const char *token,
+                            void (*done)(void *data), void *data) {
     if (endpoint == NULL || token == NULL)
         return;
-    if (cache_pending_count() == 0)
-        return;
+    if (done == NULL && cache_pending_count() == 0)
+        return; // nothing to do and nobody to notify
 
     FlushJob *job = malloc(sizeof(*job));
     if (job == NULL)
         return;
     job->endpoint = g_strdup(endpoint);
     job->token = g_strdup(token);
+    job->done = done;
+    job->data = data;
 
     pthread_t tid;
     pthread_attr_t attr;
