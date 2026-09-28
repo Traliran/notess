@@ -7,6 +7,8 @@
 //     $XDG_CACHE_HOME/noteSS (or ~/.cache/noteSS), mode 0600.
 //   - cache_flush_async() uploads every cached note in filename order in a
 //     detached background thread and deletes each file on HTTP 200/201.
+//   - cache_flush_sync() does the same in the calling thread (used after a
+//     successful send, so the app never quits before the cache is uploaded).
 //     Notes that fail to upload stay in the cache for the next launch.
 
 #ifndef NOTESS_CACHE_H
@@ -23,5 +25,9 @@ size_t cache_pending_count(void);
 // Upload all cached notes, deleting each one after HTTP 200/201.
 // Safe to call when the cache is empty (does nothing). Never blocks.
 void cache_flush_async(const char *endpoint, const char *token);
+
+// Same as above, but blocking: returns after every cached note was tried.
+// Safe to call from any worker thread (calls are serialized internally).
+void cache_flush_sync(const char *endpoint, const char *token);
 
 #endif // NOTESS_CACHE_H

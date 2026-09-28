@@ -20,6 +20,11 @@
 #define CACHE_SUBDIR "/noteSS"
 #define CACHE_SUFFIX ".txt"
 #define CACHE_TEXT_MAX (64 * 1024)
+#define FLUSH_TIMEOUT_SEC 5L // fail fast, same as the foreground send timeout
+
+// Serializes blocking flushes: the startup background flush and the
+// post-send flush in main.c may otherwise upload the same file twice.
+static pthread_mutex_t flush_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static gint cmp_filenames(gconstpointer a, gconstpointer b);
 
@@ -228,7 +233,7 @@ static gboolean cache_post_note(const char *endpoint, const char *token, const c
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cache_discard_cb);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, FLUSH_TIMEOUT_SEC);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "noteSS/1.1.0");
 
@@ -252,21 +257,29 @@ typedef struct {
 
 // Upload every cached note in order; delete each file on success.
 // Failures are left in the cache for the next launch.
-static void *flush_thread_func(void *arg) {
-    FlushJob *job = arg;
+void cache_flush_sync(const char *endpoint, const char *token) {
+    if (endpoint == NULL || token == NULL)
+        return;
 
+    pthread_mutex_lock(&flush_mutex);
     char **files = cache_list_files();
     if (files != NULL) {
         for (size_t i = 0; files[i] != NULL; i++) {
             char *text = cache_read_file(files[i]);
             if (text == NULL)
                 continue; // unreadable file: keep it, try the next one
-            if (cache_post_note(job->endpoint, job->token, text))
+            if (cache_post_note(endpoint, token, text))
                 unlink(files[i]); // uploaded: drop from the cache
             free(text);
         }
         g_strfreev(files);
     }
+    pthread_mutex_unlock(&flush_mutex);
+}
+
+static void *flush_thread_func(void *arg) {
+    FlushJob *job = arg;
+    cache_flush_sync(job->endpoint, job->token);
 
     g_free(job->endpoint);
     g_free(job->token);

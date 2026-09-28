@@ -92,8 +92,10 @@ Cache path (XDG standard):
 
 Each unsent note is one plain-text file (`note-<epoch>-<pid>-<counter>.txt`,
 mode `600`). On every start noteSS uploads cached notes oldest-first in a
-background thread; each note that gets HTTP `200`/`201` is deleted from the
-cache, the rest stay for the next launch. No extra configuration needed.
+background thread, and again right after the next successful send (the app
+would otherwise quit before the background upload finishes); each note that
+gets HTTP `200`/`201` is deleted from the cache, the rest stay for the next
+launch. No extra configuration needed.
 
 ## Project layout
 

@@ -15,7 +15,8 @@
 //   4. POST {memos_url}/api/v1/memos runs in a background pthread (UI never blocks).
 //   5. Success (200/201) closes the app; if the server is unreachable the note
 //      is saved to the local cache ($XDG_CACHE_HOME/noteSS) and uploaded
-//      on the next launch (see cache.c). Failure shows an error dialog.
+//      on the next launch: in the background at startup and right after the
+//      next successful send (see cache.c). Failure shows an error dialog.
 
 #include <ctype.h>
 #include <curl/curl.h>
@@ -343,6 +344,12 @@ static void *send_thread_func(void *arg) {
             res->message = g_strdup_printf("Server returned HTTP %ld.", code);
     }
 
+    // The current note is sent: upload cached notes in the same thread.
+    // The app quits right after a successful send, which would otherwise kill
+    // the startup background flush before it finishes.
+    if (res->ok)
+        cache_flush_sync(job->endpoint, job->token);
+
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(resp.data);
@@ -452,8 +459,11 @@ static void submit_note(MainUI *ui) {
     snprintf(endpoint, sizeof(endpoint), "%s/api/v1/memos", ui->cfg.memos_url);
 
     char *json_body = json_build_memo(text);
+    // Copy first: text points inside raw, which is freed below.
+    char *text_copy = g_strdup(text); // plain text, cached if the server is down
     g_free(raw);
     if (json_body == NULL) {
+        g_free(text_copy);
         GtkWidget *dlg = close_dialog_new(ui->window, GTK_MESSAGE_ERROR,
                                           "Out of memory while building the request.");
         gtk_window_present(GTK_WINDOW(dlg));
@@ -463,12 +473,13 @@ static void submit_note(MainUI *ui) {
     SendJob *job = malloc(sizeof(*job));
     if (job == NULL) {
         free(json_body);
+        g_free(text_copy);
         return;
     }
     job->endpoint = g_strdup(endpoint);
     job->token = g_strdup(ui->cfg.access_token);
     job->json_body = json_body; // malloc'd, freed by the worker
-    job->text = g_strdup(text); // plain text, cached if the server is down
+    job->text = text_copy;
     job->window = g_object_ref(ui->window);
     job->send_button = g_object_ref(ui->send_button);
     if (job->text == NULL) {
