@@ -109,3 +109,10 @@ launch. No extra configuration needed.
 
 GNU General Public License v3.0 or later (GPL-3.0-or-later).
 See `LICENSE` for the full text. Contributions welcome.
+
+---
+
+### Where to get a Memos token:
+
+  > <img width="1166" height="619" alt="image" src="https://github.com/user-attachments/assets/751a1aa8-ae7b-4b47-80a1-1bb7e549246f" />
+
